@@ -1006,35 +1006,46 @@ show_online_users() {
     local WHITE='\033[1;37m'
     local RESET='\033[0m'
     
+    # Function to safely get numeric value (prevents arithmetic errors)
+    safe_number() {
+        local value="$1"
+        if [[ "$value" =~ ^[0-9]+$ ]]; then
+            echo "$value"
+        else
+            echo "0"
+        fi
+    }
+    
     # Function to monitor Dropbear connections
     monitor_dropbear() {
         local user="$1"
-        local port_dropbear=$(ps aux | grep dropbear | awk 'NR==1 {print $17}')
-        local log="$AUTH_LOG"
-        local loginsukses='Password auth succeeded'
         local count=0
+        
+        # Check if dropbear is running
+        if ! pgrep -f dropbear >/dev/null 2>&1; then
+            echo "0"
+            return
+        fi
+        
+        # Get dropbear port
+        local port_dropbear=$(ps aux | grep dropbear | grep -v grep | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/ && $i > 1000) print $i}' | head -1)
         
         if [[ -z "$port_dropbear" ]]; then
             echo "0"
             return
         fi
         
-        local pids=$(ps ax | grep dropbear | grep " $port_dropbear" | awk '{print $1}')
+        # Count connections for user
+        local pids=$(ps ax | grep dropbear | grep -v grep | awk '{print $1}')
         
         for pid in $pids; do
-            local pidlogs=$(grep "$pid" "$log" 2>/dev/null | grep "$loginsukses" | awk '{print $3}')
-            local pidend=""
-            
-            for pidend_item in $pidlogs; do
-                pidend="$pidend_item"
-            done
-            
-            if [[ -n "$pidend" ]]; then
-                local login=$(grep "$pid" "$log" 2>/dev/null | grep "$pidend" | grep "$loginsukses")
-                local logged_user=$(echo "$login" | awk '{print $10}' | sed -r "s/'//g")
-                
-                if [[ "$logged_user" == "$user" ]]; then
-                    ((count++))
+            if [[ -f "$AUTH_LOG" ]]; then
+                local login_entry=$(grep "dropbear\[$pid\]" "$AUTH_LOG" 2>/dev/null | grep "Password auth succeeded" | tail -1)
+                if [[ -n "$login_entry" ]]; then
+                    local logged_user=$(echo "$login_entry" | awk '{print $10}' | sed "s/'//g")
+                    if [[ "$logged_user" == "$user" ]]; then
+                        ((count++))
+                    fi
                 fi
             fi
         done
@@ -1045,36 +1056,57 @@ show_online_users() {
     # Function to get SSH connection count for a user
     get_ssh_connections() {
         local user="$1"
-        if grep -q "^$user:" /etc/passwd 2>/dev/null; then
-            ps -u "$user" 2>/dev/null | grep -c sshd || echo "0"
-        else
+        local count=0
+        
+        # Check if user exists
+        if ! id "$user" >/dev/null 2>&1; then
             echo "0"
+            return
         fi
+        
+        # Count SSH processes for user
+        count=$(ps -u "$user" 2>/dev/null | grep -c "sshd.*priv" 2>/dev/null || echo "0")
+        
+        # Ensure we return a valid number
+        echo "$(safe_number "$count")"
     }
     
     # Function to get OpenVPN connection count for a user
     get_openvpn_connections() {
         local user="$1"
-        if [[ -e "$OPENVPN_STATUS" ]]; then
-            grep -E ",$user," "$OPENVPN_STATUS" 2>/dev/null | wc -l || echo "0"
-        else
-            echo "0"
+        local count=0
+        
+        if [[ -e "$OPENVPN_STATUS" ]] && [[ -r "$OPENVPN_STATUS" ]]; then
+            count=$(grep -c "^$user," "$OPENVPN_STATUS" 2>/dev/null || echo "0")
         fi
+        
+        echo "$(safe_number "$count")"
     }
     
     # Function to get connection time for SSH
     get_ssh_time() {
         local user="$1"
-        local ssh_pid=$(ps -u "$user" 2>/dev/null | grep sshd | awk 'NR==1 {print $1}')
         
-        if [[ -n "$ssh_pid" ]]; then
+        # Get the most recent SSH process for user
+        local ssh_pid=$(ps -u "$user" -o pid,cmd 2>/dev/null | grep "sshd.*priv" | awk 'NR==1 {print $1}' 2>/dev/null)
+        
+        if [[ -n "$ssh_pid" ]] && [[ "$ssh_pid" =~ ^[0-9]+$ ]]; then
             local etime=$(ps -o etime= -p "$ssh_pid" 2>/dev/null | tr -d ' ')
-            local time_length=${#etime}
             
-            if [[ "$time_length" -le 8 ]]; then
-                echo "00:$etime"
+            if [[ -n "$etime" ]]; then
+                # Format time properly
+                if [[ ${#etime} -le 8 ]] && [[ ! "$etime" =~ - ]]; then
+                    # Format: MM:SS or HH:MM:SS
+                    if [[ "$etime" =~ ^[0-9]+:[0-9]+$ ]]; then
+                        echo "00:$etime"
+                    else
+                        echo "$etime"
+                    fi
+                else
+                    echo "$etime"
+                fi
             else
-                echo "$etime"
+                echo "00:00:00"
             fi
         else
             echo "00:00:00"
@@ -1084,43 +1116,32 @@ show_online_users() {
     # Function to get connection time for OpenVPN
     get_openvpn_time() {
         local user="$1"
-        if [[ -e "$OPENVPN_STATUS" ]]; then
-            local start_time=$(grep -w "$user" "$OPENVPN_STATUS" 2>/dev/null | awk '{print $4}' | head -1)
-            local current_time=$(printf '%(%H:%M:%S)T\n')
+        
+        if [[ -e "$OPENVPN_STATUS" ]] && [[ -r "$OPENVPN_STATUS" ]]; then
+            local start_time=$(grep "^$user," "$OPENVPN_STATUS" 2>/dev/null | awk -F',' '{print $4}' | head -1)
             
-            if [[ -z "$start_time" ]]; then
+            if [[ -n "$start_time" ]] && [[ "$start_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+                # Calculate time difference
+                local start_epoch=$(date -d "$start_time" +%s 2>/dev/null)
+                local current_epoch=$(date +%s)
+                
+                if [[ -n "$start_epoch" ]] && [[ "$start_epoch" =~ ^[0-9]+$ ]]; then
+                    local diff_seconds=$((current_epoch - start_epoch))
+                    
+                    if [[ $diff_seconds -ge 0 ]]; then
+                        local hours=$((diff_seconds / 3600))
+                        local minutes=$(((diff_seconds % 3600) / 60))
+                        local seconds=$((diff_seconds % 60))
+                        printf "%02d:%02d:%02d\n" $hours $minutes $seconds
+                    else
+                        echo "00:00:00"
+                    fi
+                else
+                    echo "00:00:00"
+                fi
+            else
                 echo "00:00:00"
-                return
             fi
-            
-            # Parse start time
-            local start_hour=$(echo "$start_time" | cut -c 1-2)
-            local start_min=$(echo "$start_time" | cut -c 4-5)
-            local start_sec=$(echo "$start_time" | cut -c 7-8)
-            
-            # Parse current time
-            local curr_hour=$(echo "$current_time" | cut -c 1-2)
-            local curr_min=$(echo "$current_time" | cut -c 4-5)
-            local curr_sec=$(echo "$current_time" | cut -c 7-8)
-            
-            # Convert to seconds
-            local start_total=$((start_hour * 3600 + start_min * 60 + start_sec))
-            local curr_total=$((curr_hour * 3600 + curr_min * 60 + curr_sec))
-            
-            # Calculate difference
-            local diff_seconds=$((curr_total - start_total))
-            
-            # Handle day rollover
-            if [[ $diff_seconds -lt 0 ]]; then
-                diff_seconds=$((diff_seconds + 86400))
-            fi
-            
-            # Convert back to HH:MM:SS
-            local hours=$((diff_seconds / 3600))
-            local minutes=$(((diff_seconds % 3600) / 60))
-            local seconds=$((diff_seconds % 60))
-            
-            printf "%02d:%02d:%02d\n" $hours $minutes $seconds
         else
             echo "00:00:00"
         fi
@@ -1129,16 +1150,25 @@ show_online_users() {
     # Main monitoring function
     clear
     
-    # Header
+    # Professional header
     echo -e "${BLUE}┌────────────────────────────────────────────────────────────┐${RESET}"
-    echo -e "${BLUE}│${WHITE}                    ONLINE USER MONITOR                     ${BLUE}│${RESET}"
+    echo -e "${BLUE}│${WHITE}                    🔍 ONLINE USER MONITOR 🔍                ${BLUE}│${RESET}"
     echo -e "${BLUE}├────────────────────────────────────────────────────────────┤${RESET}"
-    echo -e "${BLUE}│${WHITE} User           Status      Connections    Time           ${BLUE}│${RESET}"
+    echo -e "${BLUE}│${WHITE} Username       Status       Online/Limit   Time Connected ${BLUE}│${RESET}"
     echo -e "${BLUE}├────────────────────────────────────────────────────────────┤${RESET}"
     
     # Check if database exists
     if [[ ! -f "$DATABASE" ]]; then
-        echo -e "${BLUE}│${RED} No user database found at: $DATABASE${BLUE}                │${RESET}"
+        echo -e "${BLUE}│${RED} ❌ No user database found at: $DATABASE              ${BLUE}│${RESET}"
+        echo -e "${BLUE}│${YELLOW} ℹ️  Please create users first using option 1                ${BLUE}│${RESET}"
+        echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
+        return 1
+    fi
+    
+    # Check if database is empty
+    if [[ ! -s "$DATABASE" ]]; then
+        echo -e "${BLUE}│${YELLOW} ⚠️  User database is empty                                  ${BLUE}│${RESET}"
+        echo -e "${BLUE}│${YELLOW} ℹ️  Please create users first using option 1                ${BLUE}│${RESET}"
         echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
         return 1
     fi
@@ -1149,32 +1179,40 @@ show_online_users() {
     
     # Read users from database and monitor each one
     while IFS=' ' read -r user limit; do
+        # Skip empty lines
         if [[ -z "$user" ]]; then
             continue
         fi
         
         ((total_users++))
         
-        # Get connection counts
-        local ssh_count=$(get_ssh_connections "$user")
-        local dropbear_count=$(monitor_dropbear "$user")
-        local openvpn_count=$(get_openvpn_connections "$user")
+        # Get connection counts with error handling
+        local ssh_count=$(safe_number "$(get_ssh_connections "$user")")
+        local dropbear_count=$(safe_number "$(monitor_dropbear "$user")")
+        local openvpn_count=$(safe_number "$(get_openvpn_connections "$user")")
         
-        # Calculate total connections
+        # Calculate total connections safely
         local total_connections=$((ssh_count + dropbear_count + openvpn_count))
+        
+        # Ensure limit is a valid number
+        local user_limit=$(safe_number "$limit")
+        [[ $user_limit -eq 0 ]] && user_limit="∞"
         
         # Determine status and time
         local status
         local connection_time
+        local status_icon
         
         if [[ $total_connections -eq 0 ]]; then
             status="${RED}Offline${RESET}"
+            status_icon="🔴"
             connection_time="00:00:00"
         else
             status="${GREEN}Online${RESET}"
+            status_icon="🟢"
             ((online_users++))
             
-            # Get time from active connection (prioritize SSH, then OpenVPN)
+            # Get time from active connection (prioritize SSH, then OpenVPN, then Dropbear)
             if [[ $ssh_count -gt 0 ]]; then
                 connection_time=$(get_ssh_time "$user")
             elif [[ $openvpn_count -gt 0 ]]; then
@@ -1184,17 +1222,30 @@ show_online_users() {
             fi
         fi
         
-        # Format and display user info
-        printf "${BLUE}│${YELLOW} %-13s ${WHITE}%-12s ${WHITE}%-5s/%-7s ${WHITE}%-13s ${BLUE}│${RESET}\n" \
-               "$user" "$status" "$total_connections" "$limit" "$connection_time"
+        # Format connection display
+        local connection_display
+        if [[ "$user_limit" == "∞" ]]; then
+            connection_display=$(printf "%d/∞" $total_connections)
+        else
+            connection_display=$(printf "%d/%s" $total_connections "$user_limit")
+        fi
+        
+        # Display user info with professional formatting
+        printf "${BLUE}│${status_icon} ${YELLOW}%-12s ${status}%-12s ${WHITE}%-12s ${WHITE}%-12s ${BLUE}│${RESET}\n" \
+               "$user" " " "$connection_display" "$connection_time"
         
     done < "$DATABASE"
     
     echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
     
-    # Summary
+    # Professional summary
     echo ""
-    echo -e "${YELLOW}Summary: ${WHITE}Total Users: ${GREEN}$total_users${WHITE} | Online: ${GREEN}$online_users${WHITE} | Offline: ${RED}$((total_users - online_users))${RESET}"
+    echo -e "${BLUE}📊 ${WHITE}SUMMARY:${RESET}"
+    echo -e "${WHITE}   👥 Total Users: ${GREEN}$total_users${RESET}"
+    echo -e "${WHITE}   🟢 Online: ${GREEN}$online_users${RESET}"
+    echo -e "${WHITE}   🔴 Offline: ${RED}$((total_users - online_users))${RESET}"
+    echo ""
+    echo -e "${YELLOW}💡 TIP: Press CTRL+C to return to menu${RESET}"
     echo ""
 }
 
