@@ -62,7 +62,7 @@ INSTALL_DIR="/usr/local/bin"
 # Download menu.sh from GitHub if not present locally
 if [[ ! -f "menu.sh" ]]; then
   echo "[*] Downloading menu.sh from GitHub..."
-  wget -q https://raw.githubusercontent.com/mkkelati/mk-script/main/menu.sh
+  wget -q https://raw.githubusercontent.com/mkkelati/script2/main/menu.sh
 fi
 cp -f menu.sh "${INSTALL_DIR}/menu"
 chmod +x "${INSTALL_DIR}/menu"
