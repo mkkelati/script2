@@ -1017,7 +1017,7 @@ show_online_users() {
         fi
     }
     
-    # Function to get SSL tunnel connections (stunnel)
+    # Function to get SSL tunnel connections (stunnel) - Enhanced for HTTP Injector
     get_ssl_tunnel_connections() {
         local user="$1"
         local count=0
@@ -1028,19 +1028,87 @@ show_online_users() {
             return
         fi
         
-        # Check for stunnel connections on port 443 (or configured port)
-        # Look for established connections to stunnel
-        local ssl_connections=$(netstat -tn 2>/dev/null | grep ":443.*ESTABLISHED" | wc -l)
+        # Multiple detection methods for SSL tunnel connections
         
-        # For more accurate per-user detection, check SSH processes that might be tunneled
-        # This checks if user has SSH sessions that could be through SSL tunnel
-        if [[ "$ssl_connections" -gt 0 ]]; then
-            # Check if this user has active SSH sessions (could be through tunnel)
-            local user_ssh=$(ps -u "$user" 2>/dev/null | grep -c "sshd.*priv" 2>/dev/null || echo "0")
+        # Method 1: Check for established connections to stunnel ports (443, 444, etc.)
+        local ssl_ports=$(ss -tuln 2>/dev/null | grep stunnel | awk -F: '{print $2}' | awk '{print $1}' | sort -u)
+        if [[ -z "$ssl_ports" ]]; then
+            ssl_ports="443"  # Default stunnel port
+        fi
+        
+        local total_ssl_connections=0
+        for port in $ssl_ports; do
+            local port_connections=$(ss -tn 2>/dev/null | grep ":${port}.*ESTAB" | wc -l)
+            total_ssl_connections=$((total_ssl_connections + port_connections))
+        done
+        
+        # Method 2: Check if user has active SSH sessions (these could be tunneled)
+        local user_ssh_sessions=0
+        if id "$user" >/dev/null 2>&1; then
+            # Count SSH sessions for this user
+            user_ssh_sessions=$(ps -u "$user" 2>/dev/null | grep -E "sshd.*priv|sshd.*@pts" | wc -l)
             
-            # If user has SSH sessions and there are SSL connections, assume some are tunneled
-            if [[ "$user_ssh" -gt 0 ]]; then
-                count=$user_ssh
+            # Also check for SSH connections in a different way
+            if [[ $user_ssh_sessions -eq 0 ]]; then
+                user_ssh_sessions=$(pgrep -u "$user" -f "sshd" 2>/dev/null | wc -l)
+            fi
+        fi
+        
+        # Method 3: Check netstat for SSH connections that might be tunneled
+        local ssh_connections_22=$(netstat -tn 2>/dev/null | grep ":22.*ESTABLISHED" | wc -l)
+        
+        # Method 4: Check who command for active logins
+        local who_sessions=0
+        if command -v who >/dev/null 2>&1; then
+            who_sessions=$(who 2>/dev/null | grep -c "^$user " || echo "0")
+        fi
+        
+        # Method 5: Check last command for recent logins
+        local recent_logins=0
+        if command -v last >/dev/null 2>&1; then
+            recent_logins=$(last -n 10 "$user" 2>/dev/null | grep -c "still logged in" || echo "0")
+        fi
+        
+        # Method 6: Check /proc for user processes that indicate active sessions
+        local proc_sessions=0
+        if [[ -d "/proc" ]]; then
+            # Look for bash/shell processes for this user
+            proc_sessions=$(ps -u "$user" 2>/dev/null | grep -E "bash|sh|zsh" | grep -v "sshd" | wc -l)
+        fi
+        
+        # Determine if user is connected via SSL tunnel
+        # If there are SSL connections AND the user has any kind of session, count it
+        if [[ $total_ssl_connections -gt 0 ]]; then
+            # Check multiple indicators of user activity
+            local user_activity=$((user_ssh_sessions + who_sessions + recent_logins + proc_sessions))
+            
+            if [[ $user_activity -gt 0 ]]; then
+                # User has some kind of session activity and there are SSL connections
+                count=1  # Count as one SSL connection for this user
+                
+                # If user has multiple SSH sessions, count them
+                if [[ $user_ssh_sessions -gt 1 ]]; then
+                    count=$user_ssh_sessions
+                fi
+            fi
+        fi
+        
+        # Method 7: Direct check for user in current connections
+        # Check if user appears in current SSH connections via different methods
+        if [[ $count -eq 0 ]]; then
+            # Check auth.log for recent successful logins
+            if [[ -f "/var/log/auth.log" ]]; then
+                local recent_auth=$(grep "sshd.*Accepted.*$user" /var/log/auth.log 2>/dev/null | tail -1)
+                if [[ -n "$recent_auth" ]]; then
+                    # Check if this login session is still active (within last 10 minutes)
+                    local login_time=$(echo "$recent_auth" | awk '{print $1" "$2" "$3}')
+                    local current_time=$(date "+%b %d %H:%M")
+                    
+                    # Simple check - if we see recent auth and there are active connections, count it
+                    if [[ $total_ssl_connections -gt 0 ]] || [[ $ssh_connections_22 -gt 0 ]]; then
+                        count=1
+                    fi
+                fi
             fi
         fi
         
@@ -1092,7 +1160,7 @@ show_online_users() {
         echo "$count"
     }
     
-    # Function to get SSH connection count for a user
+    # Function to get SSH connection count for a user - Enhanced
     get_ssh_connections() {
         local user="$1"
         local count=0
@@ -1103,8 +1171,42 @@ show_online_users() {
             return
         fi
         
-        # Count SSH processes for user
-        count=$(ps -u "$user" 2>/dev/null | grep -c "sshd.*priv" 2>/dev/null || echo "0")
+        # Method 1: Count SSH processes for user (most reliable)
+        local sshd_priv=$(ps -u "$user" 2>/dev/null | grep -c "sshd.*priv" 2>/dev/null || echo "0")
+        local sshd_pts=$(ps -u "$user" 2>/dev/null | grep -c "sshd.*@pts" 2>/dev/null || echo "0")
+        
+        # Method 2: Alternative SSH process detection
+        local sshd_pgrep=0
+        if command -v pgrep >/dev/null 2>&1; then
+            sshd_pgrep=$(pgrep -u "$user" -f "sshd" 2>/dev/null | wc -l || echo "0")
+        fi
+        
+        # Method 3: Check who command for active TTY sessions
+        local who_count=0
+        if command -v who >/dev/null 2>&1; then
+            who_count=$(who 2>/dev/null | grep "^$user " | wc -l || echo "0")
+        fi
+        
+        # Method 4: Check w command for active sessions
+        local w_count=0
+        if command -v w >/dev/null 2>&1; then
+            w_count=$(w 2>/dev/null | grep "^$user " | wc -l || echo "0")
+        fi
+        
+        # Method 5: Check for user shells/sessions
+        local shell_count=0
+        shell_count=$(ps -u "$user" -o comm 2>/dev/null | grep -E "^(bash|sh|zsh|dash)$" | wc -l || echo "0")
+        
+        # Use the highest count from reliable methods
+        count=$sshd_priv
+        [[ $sshd_pts -gt $count ]] && count=$sshd_pts
+        [[ $who_count -gt $count ]] && count=$who_count
+        [[ $w_count -gt $count ]] && count=$w_count
+        
+        # If no SSH processes but user has active shells, count as 1 (could be tunneled)
+        if [[ $count -eq 0 ]] && [[ $shell_count -gt 0 ]]; then
+            count=1
+        fi
         
         # Ensure we return a valid number
         echo "$(safe_number "$count")"
@@ -1253,6 +1355,9 @@ show_online_users() {
             local dropbear_count=$(safe_number "$(monitor_dropbear "$user")")
             local openvpn_count=$(safe_number "$(get_openvpn_connections "$user")")
             
+            # Debug info (comment out for production)
+            # echo "DEBUG: User $user - SSH:$ssh_count SSL:$ssl_count DBR:$dropbear_count VPN:$openvpn_count" >&2
+            
             # Add to totals
             total_ssh=$((total_ssh + ssh_count))
             total_ssl=$((total_ssl + ssl_count))
@@ -1326,6 +1431,19 @@ show_online_users() {
         echo -e "${BLUE}📊 ${WHITE}REAL-TIME SUMMARY:${RESET}"
         echo -e "${WHITE}   👥 Total Users: ${GREEN}$total_users${WHITE} | 🟢 Online: ${GREEN}$online_users${WHITE} | 🔴 Offline: ${RED}$((total_users - online_users))${RESET}"
         echo -e "${WHITE}   🔗 Connections: SSH(${GREEN}$total_ssh${WHITE}) SSL(${YELLOW}$total_ssl${WHITE}) VPN(${BLUE}$total_openvpn${WHITE}) DBR(${GREEN}$total_dropbear${WHITE})${RESET}"
+        
+        # Show system connection status for debugging
+        local stunnel_status="❌"
+        local stunnel_connections=0
+        if pgrep -f stunnel >/dev/null 2>&1; then
+            stunnel_status="✅"
+            stunnel_connections=$(ss -tn 2>/dev/null | grep ":443.*ESTAB" | wc -l)
+        fi
+        
+        local ssh_port_connections=$(ss -tn 2>/dev/null | grep ":22.*ESTAB" | wc -l)
+        local total_established=$(ss -tn 2>/dev/null | grep "ESTAB" | wc -l)
+        
+        echo -e "${WHITE}   🛡️  System: Stunnel${stunnel_status} SSL-Conns(${stunnel_connections}) SSH-Port(${ssh_port_connections}) Total(${total_established})${RESET}"
         echo ""
     }
     
