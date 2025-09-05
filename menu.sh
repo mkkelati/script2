@@ -997,6 +997,7 @@ show_online_users() {
     local DATABASE="$USER_LIST_FILE"
     local OPENVPN_STATUS="/etc/openvpn/openvpn-status.log"
     local AUTH_LOG="/var/log/auth.log"
+    local REFRESH_INTERVAL=3
     
     # Colors for display
     local RED='\033[1;31m'
@@ -1016,6 +1017,36 @@ show_online_users() {
         fi
     }
     
+    # Function to get SSL tunnel connections (stunnel)
+    get_ssl_tunnel_connections() {
+        local user="$1"
+        local count=0
+        
+        # Check if stunnel is running
+        if ! pgrep -f stunnel >/dev/null 2>&1; then
+            echo "0"
+            return
+        fi
+        
+        # Check for stunnel connections on port 443 (or configured port)
+        # Look for established connections to stunnel
+        local ssl_connections=$(netstat -tn 2>/dev/null | grep ":443.*ESTABLISHED" | wc -l)
+        
+        # For more accurate per-user detection, check SSH processes that might be tunneled
+        # This checks if user has SSH sessions that could be through SSL tunnel
+        if [[ "$ssl_connections" -gt 0 ]]; then
+            # Check if this user has active SSH sessions (could be through tunnel)
+            local user_ssh=$(ps -u "$user" 2>/dev/null | grep -c "sshd.*priv" 2>/dev/null || echo "0")
+            
+            # If user has SSH sessions and there are SSL connections, assume some are tunneled
+            if [[ "$user_ssh" -gt 0 ]]; then
+                count=$user_ssh
+            fi
+        fi
+        
+        echo "$count"
+    }
+    
     # Function to monitor Dropbear connections
     monitor_dropbear() {
         local user="$1"
@@ -1027,28 +1058,36 @@ show_online_users() {
             return
         fi
         
-        # Get dropbear port
-        local port_dropbear=$(ps aux | grep dropbear | grep -v grep | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+$/ && $i > 1000) print $i}' | head -1)
+        # More accurate dropbear detection
+        local dropbear_pids=$(pgrep -f "dropbear.*-p" 2>/dev/null)
         
-        if [[ -z "$port_dropbear" ]]; then
-            echo "0"
-            return
-        fi
-        
-        # Count connections for user
-        local pids=$(ps ax | grep dropbear | grep -v grep | awk '{print $1}')
-        
-        for pid in $pids; do
-            if [[ -f "$AUTH_LOG" ]]; then
-                local login_entry=$(grep "dropbear\[$pid\]" "$AUTH_LOG" 2>/dev/null | grep "Password auth succeeded" | tail -1)
-                if [[ -n "$login_entry" ]]; then
-                    local logged_user=$(echo "$login_entry" | awk '{print $10}' | sed "s/'//g")
-                    if [[ "$logged_user" == "$user" ]]; then
-                        ((count++))
-                    fi
+        for pid in $dropbear_pids; do
+            # Check the command line for this PID to see if it's a user session
+            local cmd_line=$(ps -p "$pid" -o cmd --no-headers 2>/dev/null)
+            
+            # If it's a user session (not the main dropbear process)
+            if [[ "$cmd_line" =~ dropbear.*@.*pts ]]; then
+                # Try to determine the user from the process
+                local process_user=$(ps -p "$pid" -o user --no-headers 2>/dev/null | tr -d ' ')
+                if [[ "$process_user" == "$user" ]]; then
+                    ((count++))
                 fi
             fi
         done
+        
+        # Fallback: check auth logs for more recent connections
+        if [[ $count -eq 0 ]] && [[ -f "$AUTH_LOG" ]]; then
+            # Look for recent dropbear logins for this user
+            local recent_logins=$(grep "dropbear" "$AUTH_LOG" 2>/dev/null | grep "Password auth succeeded" | grep "$user" | tail -5)
+            while IFS= read -r line; do
+                if [[ -n "$line" ]]; then
+                    local login_pid=$(echo "$line" | sed -n 's/.*dropbear\[\([0-9]*\)\].*/\1/p')
+                    if [[ -n "$login_pid" ]] && kill -0 "$login_pid" 2>/dev/null; then
+                        ((count++))
+                    fi
+                fi
+            done <<< "$recent_logins"
+        fi
         
         echo "$count"
     }
@@ -1076,8 +1115,34 @@ show_online_users() {
         local user="$1"
         local count=0
         
-        if [[ -e "$OPENVPN_STATUS" ]] && [[ -r "$OPENVPN_STATUS" ]]; then
-            count=$(grep -c "^$user," "$OPENVPN_STATUS" 2>/dev/null || echo "0")
+        # Check multiple possible OpenVPN status file locations
+        local status_files=(
+            "/etc/openvpn/openvpn-status.log"
+            "/var/log/openvpn/openvpn-status.log"
+            "/var/log/openvpn-status.log"
+            "/etc/openvpn/server/openvpn-status.log"
+        )
+        
+        for status_file in "${status_files[@]}"; do
+            if [[ -e "$status_file" ]] && [[ -r "$status_file" ]]; then
+                # Look for user in connected clients section
+                local temp_count=$(grep "^$user," "$status_file" 2>/dev/null | wc -l)
+                count=$((count + temp_count))
+            fi
+        done
+        
+        # Additional check: look for OpenVPN processes that might indicate connections
+        if [[ $count -eq 0 ]]; then
+            # Check if OpenVPN is running and has connections
+            if pgrep -f openvpn >/dev/null 2>&1; then
+                # Look for tun/tap interfaces which indicate VPN connections
+                local vpn_interfaces=$(ip link show 2>/dev/null | grep -c "tun\|tap" || echo "0")
+                if [[ $vpn_interfaces -gt 0 ]]; then
+                    # This is a rough estimate - in real scenarios you'd need more specific detection
+                    # For now, we'll rely on the status file primarily
+                    count=0
+                fi
+            fi
         fi
         
         echo "$(safe_number "$count")"
@@ -1147,106 +1212,156 @@ show_online_users() {
         fi
     }
     
-    # Main monitoring function
-    clear
-    
-    # Professional header
-    echo -e "${BLUE}┌────────────────────────────────────────────────────────────┐${RESET}"
-    echo -e "${BLUE}│${WHITE}                    🔍 ONLINE USER MONITOR 🔍                ${BLUE}│${RESET}"
-    echo -e "${BLUE}├────────────────────────────────────────────────────────────┤${RESET}"
-    echo -e "${BLUE}│${WHITE} Username       Status       Online/Limit   Time Connected ${BLUE}│${RESET}"
-    echo -e "${BLUE}├────────────────────────────────────────────────────────────┤${RESET}"
-    
-    # Check if database exists
-    if [[ ! -f "$DATABASE" ]]; then
-        echo -e "${BLUE}│${RED} ❌ No user database found at: $DATABASE              ${BLUE}│${RESET}"
-        echo -e "${BLUE}│${YELLOW} ℹ️  Please create users first using option 1                ${BLUE}│${RESET}"
-        echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
-        return 1
-    fi
-    
-    # Check if database is empty
-    if [[ ! -s "$DATABASE" ]]; then
-        echo -e "${BLUE}│${YELLOW} ⚠️  User database is empty                                  ${BLUE}│${RESET}"
-        echo -e "${BLUE}│${YELLOW} ℹ️  Please create users first using option 1                ${BLUE}│${RESET}"
-        echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
-        return 1
-    fi
-    
-    # Initialize counters
-    local total_users=0
-    local online_users=0
-    
-    # Read users from database and monitor each one
-    while IFS=' ' read -r user limit; do
-        # Skip empty lines
-        if [[ -z "$user" ]]; then
-            continue
+    # Function to display user monitoring data
+    display_user_monitor() {
+        # Check if database exists
+        if [[ ! -f "$DATABASE" ]]; then
+            echo -e "${BLUE}│${RED} ❌ No user database found at: $DATABASE              ${BLUE}│${RESET}"
+            echo -e "${BLUE}│${YELLOW} ℹ️  Please create users first using option 1                ${BLUE}│${RESET}"
+            echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
+            return 1
         fi
         
-        ((total_users++))
+        # Check if database is empty
+        if [[ ! -s "$DATABASE" ]]; then
+            echo -e "${BLUE}│${YELLOW} ⚠️  User database is empty                                  ${BLUE}│${RESET}"
+            echo -e "${BLUE}│${YELLOW} ℹ️  Please create users first using option 1                ${BLUE}│${RESET}"
+            echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
+            return 1
+        fi
         
-        # Get connection counts with error handling
-        local ssh_count=$(safe_number "$(get_ssh_connections "$user")")
-        local dropbear_count=$(safe_number "$(monitor_dropbear "$user")")
-        local openvpn_count=$(safe_number "$(get_openvpn_connections "$user")")
+        # Initialize counters
+        local total_users=0
+        local online_users=0
+        local total_ssh=0
+        local total_ssl=0
+        local total_dropbear=0
+        local total_openvpn=0
         
-        # Calculate total connections safely
-        local total_connections=$((ssh_count + dropbear_count + openvpn_count))
-        
-        # Ensure limit is a valid number
-        local user_limit=$(safe_number "$limit")
-        [[ $user_limit -eq 0 ]] && user_limit="∞"
-        
-        # Determine status and time
-        local status
-        local connection_time
-        local status_icon
-        
-        if [[ $total_connections -eq 0 ]]; then
-            status="${RED}Offline${RESET}"
-            status_icon="🔴"
-            connection_time="00:00:00"
-        else
-            status="${GREEN}Online${RESET}"
-            status_icon="🟢"
-            ((online_users++))
-            
-            # Get time from active connection (prioritize SSH, then OpenVPN, then Dropbear)
-            if [[ $ssh_count -gt 0 ]]; then
-                connection_time=$(get_ssh_time "$user")
-            elif [[ $openvpn_count -gt 0 ]]; then
-                connection_time=$(get_openvpn_time "$user")
-            else
-                connection_time="00:00:00"
+        # Read users from database and monitor each one
+        while IFS=' ' read -r user limit; do
+            # Skip empty lines
+            if [[ -z "$user" ]]; then
+                continue
             fi
-        fi
+            
+            ((total_users++))
+            
+            # Get connection counts with error handling
+            local ssh_count=$(safe_number "$(get_ssh_connections "$user")")
+            local ssl_count=$(safe_number "$(get_ssl_tunnel_connections "$user")")
+            local dropbear_count=$(safe_number "$(monitor_dropbear "$user")")
+            local openvpn_count=$(safe_number "$(get_openvpn_connections "$user")")
+            
+            # Add to totals
+            total_ssh=$((total_ssh + ssh_count))
+            total_ssl=$((total_ssl + ssl_count))
+            total_dropbear=$((total_dropbear + dropbear_count))
+            total_openvpn=$((total_openvpn + openvpn_count))
+            
+            # Calculate total connections safely
+            local total_connections=$((ssh_count + ssl_count + dropbear_count + openvpn_count))
+            
+            # Ensure limit is a valid number
+            local user_limit=$(safe_number "$limit")
+            [[ $user_limit -eq 0 ]] && user_limit="∞"
+            
+            # Determine status and time
+            local status
+            local connection_time
+            local status_icon
+            local connection_type=""
+            
+            if [[ $total_connections -eq 0 ]]; then
+                status="${RED}Offline${RESET}"
+                status_icon="🔴"
+                connection_time="00:00:00"
+            else
+                status="${GREEN}Online${RESET}"
+                status_icon="🟢"
+                ((online_users++))
+                
+                # Determine connection type and get time
+                if [[ $ssh_count -gt 0 ]]; then
+                    connection_time=$(get_ssh_time "$user")
+                    connection_type="SSH"
+                elif [[ $ssl_count -gt 0 ]]; then
+                    connection_time=$(get_ssh_time "$user")  # SSL tunnel still uses SSH
+                    connection_type="SSL"
+                elif [[ $openvpn_count -gt 0 ]]; then
+                    connection_time=$(get_openvpn_time "$user")
+                    connection_type="VPN"
+                elif [[ $dropbear_count -gt 0 ]]; then
+                    connection_time="00:00:00"  # Dropbear time tracking is complex
+                    connection_type="DBR"
+                else
+                    connection_time="00:00:00"
+                fi
+            fi
+            
+            # Format connection display
+            local connection_display
+            if [[ "$user_limit" == "∞" ]]; then
+                connection_display=$(printf "%d/∞" $total_connections)
+            else
+                connection_display=$(printf "%d/%s" $total_connections "$user_limit")
+            fi
+            
+            # Format connection type display
+            local type_display=""
+            if [[ $total_connections -gt 0 ]]; then
+                type_display="[$connection_type]"
+            fi
+            
+            # Display user info with professional formatting
+            printf "${BLUE}│${status_icon} ${YELLOW}%-11s ${status}%-8s ${WHITE}%-10s ${WHITE}%-12s ${GREEN}%-6s ${BLUE}│${RESET}\n" \
+                   "$user" " " "$connection_display" "$connection_time" "$type_display"
+            
+        done < "$DATABASE"
         
-        # Format connection display
-        local connection_display
-        if [[ "$user_limit" == "∞" ]]; then
-            connection_display=$(printf "%d/∞" $total_connections)
-        else
-            connection_display=$(printf "%d/%s" $total_connections "$user_limit")
-        fi
+        echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
         
-        # Display user info with professional formatting
-        printf "${BLUE}│${status_icon} ${YELLOW}%-12s ${status}%-12s ${WHITE}%-12s ${WHITE}%-12s ${BLUE}│${RESET}\n" \
-               "$user" " " "$connection_display" "$connection_time"
-        
-    done < "$DATABASE"
+        # Professional summary with connection types
+        echo ""
+        echo -e "${BLUE}📊 ${WHITE}REAL-TIME SUMMARY:${RESET}"
+        echo -e "${WHITE}   👥 Total Users: ${GREEN}$total_users${WHITE} | 🟢 Online: ${GREEN}$online_users${WHITE} | 🔴 Offline: ${RED}$((total_users - online_users))${RESET}"
+        echo -e "${WHITE}   🔗 Connections: SSH(${GREEN}$total_ssh${WHITE}) SSL(${YELLOW}$total_ssl${WHITE}) VPN(${BLUE}$total_openvpn${WHITE}) DBR(${GREEN}$total_dropbear${WHITE})${RESET}"
+        echo ""
+    }
     
-    echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
+    # Main real-time monitoring function
+    echo -e "${GREEN}🚀 Starting Real-Time User Monitor...${RESET}"
+    echo -e "${YELLOW}⚡ Auto-refresh every $REFRESH_INTERVAL seconds${RESET}"
+    echo -e "${WHITE}💡 Press CTRL+C to return to menu${RESET}"
+    echo ""
+    sleep 2
     
-    # Professional summary
-    echo ""
-    echo -e "${BLUE}📊 ${WHITE}SUMMARY:${RESET}"
-    echo -e "${WHITE}   👥 Total Users: ${GREEN}$total_users${RESET}"
-    echo -e "${WHITE}   🟢 Online: ${GREEN}$online_users${RESET}"
-    echo -e "${WHITE}   🔴 Offline: ${RED}$((total_users - online_users))${RESET}"
-    echo ""
-    echo -e "${YELLOW}💡 TIP: Press CTRL+C to return to menu${RESET}"
-    echo ""
+    # Trap CTRL+C to exit gracefully
+    trap 'echo -e "\n${YELLOW}📡 Real-time monitoring stopped${RESET}"; return 0' INT
+    
+    # Real-time monitoring loop
+    while true; do
+        # Clear screen and show header
+        clear
+        local current_time=$(date "+%Y-%m-%d %H:%M:%S")
+        
+        # Professional header with timestamp
+        echo -e "${BLUE}┌────────────────────────────────────────────────────────────┐${RESET}"
+        echo -e "${BLUE}│${WHITE}              🔍 REAL-TIME USER MONITOR 🔍                   ${BLUE}│${RESET}"
+        echo -e "${BLUE}│${WHITE}                  Last Update: $current_time             ${BLUE}│${RESET}"
+        echo -e "${BLUE}├────────────────────────────────────────────────────────────┤${RESET}"
+        echo -e "${BLUE}│${WHITE} User        Status   Online/Limit Time Connected Type  ${BLUE}│${RESET}"
+        echo -e "${BLUE}├────────────────────────────────────────────────────────────┤${RESET}"
+        
+        # Display current data
+        display_user_monitor
+        
+        # Show refresh info
+        echo -e "${GREEN}🔄 Refreshing in $REFRESH_INTERVAL seconds... ${YELLOW}(Press CTRL+C to exit)${RESET}"
+        
+        # Wait for refresh interval
+        sleep $REFRESH_INTERVAL
+    done
 }
 
 uninstall_script() {
