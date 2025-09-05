@@ -993,7 +993,7 @@ EOC
 }
 
 show_online_users() {
-    # Configuration
+    # Configuration - Using proven working paths
     local DATABASE="$USER_LIST_FILE"
     local OPENVPN_STATUS="/etc/openvpn/openvpn-status.log"
     local AUTH_LOG="/var/log/auth.log"
@@ -1017,304 +1017,127 @@ show_online_users() {
         fi
     }
     
-    # Function to get SSL tunnel connections (stunnel) - Enhanced for HTTP Injector
-    get_ssl_tunnel_connections() {
-        local user="$1"
-        local count=0
-        
-        # Check if stunnel is running
-        if ! pgrep -f stunnel >/dev/null 2>&1; then
-            echo "0"
-            return
-        fi
-        
-        # Multiple detection methods for SSL tunnel connections
-        
-        # Method 1: Check for established connections to stunnel ports (443, 444, etc.)
-        local ssl_ports=$(ss -tuln 2>/dev/null | grep stunnel | awk -F: '{print $2}' | awk '{print $1}' | sort -u)
-        if [[ -z "$ssl_ports" ]]; then
-            ssl_ports="443"  # Default stunnel port
-        fi
-        
-        local total_ssl_connections=0
-        for port in $ssl_ports; do
-            local port_connections=$(ss -tn 2>/dev/null | grep ":${port}.*ESTAB" | wc -l)
-            total_ssl_connections=$((total_ssl_connections + port_connections))
-        done
-        
-        # Method 2: Check if user has active SSH sessions (these could be tunneled)
-        local user_ssh_sessions=0
-        if id "$user" >/dev/null 2>&1; then
-            # Count SSH sessions for this user
-            user_ssh_sessions=$(ps -u "$user" 2>/dev/null | grep -E "sshd.*priv|sshd.*@pts" | wc -l)
-            
-            # Also check for SSH connections in a different way
-            if [[ $user_ssh_sessions -eq 0 ]]; then
-                user_ssh_sessions=$(pgrep -u "$user" -f "sshd" 2>/dev/null | wc -l)
-            fi
-        fi
-        
-        # Method 3: Check netstat for SSH connections that might be tunneled
-        local ssh_connections_22=$(netstat -tn 2>/dev/null | grep ":22.*ESTABLISHED" | wc -l)
-        
-        # Method 4: Check who command for active logins
-        local who_sessions=0
-        if command -v who >/dev/null 2>&1; then
-            who_sessions=$(who 2>/dev/null | grep -c "^$user " || echo "0")
-        fi
-        
-        # Method 5: Check last command for recent logins
-        local recent_logins=0
-        if command -v last >/dev/null 2>&1; then
-            recent_logins=$(last -n 10 "$user" 2>/dev/null | grep -c "still logged in" || echo "0")
-        fi
-        
-        # Method 6: Check /proc for user processes that indicate active sessions
-        local proc_sessions=0
-        if [[ -d "/proc" ]]; then
-            # Look for bash/shell processes for this user
-            proc_sessions=$(ps -u "$user" 2>/dev/null | grep -E "bash|sh|zsh" | grep -v "sshd" | wc -l)
-        fi
-        
-        # Determine if user is connected via SSL tunnel
-        # If there are SSL connections AND the user has any kind of session, count it
-        if [[ $total_ssl_connections -gt 0 ]]; then
-            # Check multiple indicators of user activity
-            local user_activity=$((user_ssh_sessions + who_sessions + recent_logins + proc_sessions))
-            
-            if [[ $user_activity -gt 0 ]]; then
-                # User has some kind of session activity and there are SSL connections
-                count=1  # Count as one SSL connection for this user
-                
-                # If user has multiple SSH sessions, count them
-                if [[ $user_ssh_sessions -gt 1 ]]; then
-                    count=$user_ssh_sessions
-                fi
-            fi
-        fi
-        
-        # Method 7: Direct check for user in current connections
-        # Check if user appears in current SSH connections via different methods
-        if [[ $count -eq 0 ]]; then
-            # Check auth.log for recent successful logins
-            if [[ -f "/var/log/auth.log" ]]; then
-                local recent_auth=$(grep "sshd.*Accepted.*$user" /var/log/auth.log 2>/dev/null | tail -1)
-                if [[ -n "$recent_auth" ]]; then
-                    # Check if this login session is still active (within last 10 minutes)
-                    local login_time=$(echo "$recent_auth" | awk '{print $1" "$2" "$3}')
-                    local current_time=$(date "+%b %d %H:%M")
-                    
-                    # Simple check - if we see recent auth and there are active connections, count it
-                    if [[ $total_ssl_connections -gt 0 ]] || [[ $ssh_connections_22 -gt 0 ]]; then
-                        count=1
-                    fi
-                fi
-            fi
-        fi
-        
-        echo "$count"
-    }
-    
-    # Function to monitor Dropbear connections
+    # Function to monitor Dropbear connections - Proven Working Version
     monitor_dropbear() {
         local user="$1"
+        local port_dropbear=$(ps aux | grep dropbear | awk 'NR==1 {print $17}')
+        local log="$AUTH_LOG"
+        local loginsukses='Password auth succeeded'
         local count=0
         
-        # Check if dropbear is running
-        if ! pgrep -f dropbear >/dev/null 2>&1; then
+        if [[ -z "$port_dropbear" ]]; then
             echo "0"
             return
         fi
         
-        # More accurate dropbear detection
-        local dropbear_pids=$(pgrep -f "dropbear.*-p" 2>/dev/null)
+        local pids=$(ps ax | grep dropbear | grep " $port_dropbear" | awk '{print $1}')
         
-        for pid in $dropbear_pids; do
-            # Check the command line for this PID to see if it's a user session
-            local cmd_line=$(ps -p "$pid" -o cmd --no-headers 2>/dev/null)
+        for pid in $pids; do
+            local pidlogs=$(grep "$pid" "$log" 2>/dev/null | grep "$loginsukses" | awk '{print $3}')
+            local pidend=""
             
-            # If it's a user session (not the main dropbear process)
-            if [[ "$cmd_line" =~ dropbear.*@.*pts ]]; then
-                # Try to determine the user from the process
-                local process_user=$(ps -p "$pid" -o user --no-headers 2>/dev/null | tr -d ' ')
-                if [[ "$process_user" == "$user" ]]; then
+            for pidend_item in $pidlogs; do
+                pidend="$pidend_item"
+            done
+            
+            if [[ -n "$pidend" ]]; then
+                local login=$(grep "$pid" "$log" 2>/dev/null | grep "$pidend" | grep "$loginsukses")
+                local logged_user=$(echo "$login" | awk '{print $10}' | sed -r "s/'//g")
+                
+                if [[ "$logged_user" == "$user" ]]; then
                     ((count++))
                 fi
             fi
         done
         
-        # Fallback: check auth logs for more recent connections
-        if [[ $count -eq 0 ]] && [[ -f "$AUTH_LOG" ]]; then
-            # Look for recent dropbear logins for this user
-            local recent_logins=$(grep "dropbear" "$AUTH_LOG" 2>/dev/null | grep "Password auth succeeded" | grep "$user" | tail -5)
-            while IFS= read -r line; do
-                if [[ -n "$line" ]]; then
-                    local login_pid=$(echo "$line" | sed -n 's/.*dropbear\[\([0-9]*\)\].*/\1/p')
-                    if [[ -n "$login_pid" ]] && kill -0 "$login_pid" 2>/dev/null; then
-                        ((count++))
-                    fi
-                fi
-            done <<< "$recent_logins"
-        fi
-        
         echo "$count"
     }
     
-    # Function to get SSH connection count for a user - Enhanced
+    # Function to get SSH connection count for a user - Proven Working Version
     get_ssh_connections() {
         local user="$1"
-        local count=0
-        
-        # Check if user exists
-        if ! id "$user" >/dev/null 2>&1; then
+        if grep -q "^$user:" /etc/passwd 2>/dev/null; then
+            ps -u "$user" 2>/dev/null | grep -c sshd || echo "0"
+        else
             echo "0"
-            return
         fi
-        
-        # Method 1: Count SSH processes for user (most reliable)
-        local sshd_priv=$(ps -u "$user" 2>/dev/null | grep -c "sshd.*priv" 2>/dev/null || echo "0")
-        local sshd_pts=$(ps -u "$user" 2>/dev/null | grep -c "sshd.*@pts" 2>/dev/null || echo "0")
-        
-        # Method 2: Alternative SSH process detection
-        local sshd_pgrep=0
-        if command -v pgrep >/dev/null 2>&1; then
-            sshd_pgrep=$(pgrep -u "$user" -f "sshd" 2>/dev/null | wc -l || echo "0")
-        fi
-        
-        # Method 3: Check who command for active TTY sessions
-        local who_count=0
-        if command -v who >/dev/null 2>&1; then
-            who_count=$(who 2>/dev/null | grep "^$user " | wc -l || echo "0")
-        fi
-        
-        # Method 4: Check w command for active sessions
-        local w_count=0
-        if command -v w >/dev/null 2>&1; then
-            w_count=$(w 2>/dev/null | grep "^$user " | wc -l || echo "0")
-        fi
-        
-        # Method 5: Check for user shells/sessions
-        local shell_count=0
-        shell_count=$(ps -u "$user" -o comm 2>/dev/null | grep -E "^(bash|sh|zsh|dash)$" | wc -l || echo "0")
-        
-        # Use the highest count from reliable methods
-        count=$sshd_priv
-        [[ $sshd_pts -gt $count ]] && count=$sshd_pts
-        [[ $who_count -gt $count ]] && count=$who_count
-        [[ $w_count -gt $count ]] && count=$w_count
-        
-        # If no SSH processes but user has active shells, count as 1 (could be tunneled)
-        if [[ $count -eq 0 ]] && [[ $shell_count -gt 0 ]]; then
-            count=1
-        fi
-        
-        # Ensure we return a valid number
-        echo "$(safe_number "$count")"
     }
     
-    # Function to get OpenVPN connection count for a user
+    # Function to get OpenVPN connection count for a user - Proven Working Version
     get_openvpn_connections() {
         local user="$1"
-        local count=0
-        
-        # Check multiple possible OpenVPN status file locations
-        local status_files=(
-            "/etc/openvpn/openvpn-status.log"
-            "/var/log/openvpn/openvpn-status.log"
-            "/var/log/openvpn-status.log"
-            "/etc/openvpn/server/openvpn-status.log"
-        )
-        
-        for status_file in "${status_files[@]}"; do
-            if [[ -e "$status_file" ]] && [[ -r "$status_file" ]]; then
-                # Look for user in connected clients section
-                local temp_count=$(grep "^$user," "$status_file" 2>/dev/null | wc -l)
-                count=$((count + temp_count))
-            fi
-        done
-        
-        # Additional check: look for OpenVPN processes that might indicate connections
-        if [[ $count -eq 0 ]]; then
-            # Check if OpenVPN is running and has connections
-            if pgrep -f openvpn >/dev/null 2>&1; then
-                # Look for tun/tap interfaces which indicate VPN connections
-                local vpn_interfaces=$(ip link show 2>/dev/null | grep -c "tun\|tap" || echo "0")
-                if [[ $vpn_interfaces -gt 0 ]]; then
-                    # This is a rough estimate - in real scenarios you'd need more specific detection
-                    # For now, we'll rely on the status file primarily
-                    count=0
-                fi
-            fi
+        if [[ -e "$OPENVPN_STATUS" ]]; then
+            grep -E ",$user," "$OPENVPN_STATUS" 2>/dev/null | wc -l || echo "0"
+        else
+            echo "0"
         fi
-        
-        echo "$(safe_number "$count")"
     }
     
-    # Function to get connection time for SSH
+    # Function to get connection time for SSH - Proven Working Version
     get_ssh_time() {
         local user="$1"
+        local ssh_pid=$(ps -u "$user" 2>/dev/null | grep sshd | awk 'NR==1 {print $1}')
         
-        # Get the most recent SSH process for user
-        local ssh_pid=$(ps -u "$user" -o pid,cmd 2>/dev/null | grep "sshd.*priv" | awk 'NR==1 {print $1}' 2>/dev/null)
-        
-        if [[ -n "$ssh_pid" ]] && [[ "$ssh_pid" =~ ^[0-9]+$ ]]; then
+        if [[ -n "$ssh_pid" ]]; then
             local etime=$(ps -o etime= -p "$ssh_pid" 2>/dev/null | tr -d ' ')
+            local time_length=${#etime}
             
-            if [[ -n "$etime" ]]; then
-                # Format time properly
-                if [[ ${#etime} -le 8 ]] && [[ ! "$etime" =~ - ]]; then
-                    # Format: MM:SS or HH:MM:SS
-                    if [[ "$etime" =~ ^[0-9]+:[0-9]+$ ]]; then
-                        echo "00:$etime"
-                    else
-                        echo "$etime"
-                    fi
-                else
-                    echo "$etime"
-                fi
+            if [[ "$time_length" -le 8 ]]; then
+                echo "00:$etime"
             else
-                echo "00:00:00"
+                echo "$etime"
             fi
         else
             echo "00:00:00"
         fi
     }
     
-    # Function to get connection time for OpenVPN
+    # Function to get connection time for OpenVPN - Proven Working Version
     get_openvpn_time() {
         local user="$1"
-        
-        if [[ -e "$OPENVPN_STATUS" ]] && [[ -r "$OPENVPN_STATUS" ]]; then
-            local start_time=$(grep "^$user," "$OPENVPN_STATUS" 2>/dev/null | awk -F',' '{print $4}' | head -1)
+        if [[ -e "$OPENVPN_STATUS" ]]; then
+            local start_time=$(grep -w "$user" "$OPENVPN_STATUS" 2>/dev/null | awk '{print $4}' | head -1)
+            local current_time=$(printf '%(%H:%M:%S)T\n')
             
-            if [[ -n "$start_time" ]] && [[ "$start_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
-                # Calculate time difference
-                local start_epoch=$(date -d "$start_time" +%s 2>/dev/null)
-                local current_epoch=$(date +%s)
-                
-                if [[ -n "$start_epoch" ]] && [[ "$start_epoch" =~ ^[0-9]+$ ]]; then
-                    local diff_seconds=$((current_epoch - start_epoch))
-                    
-                    if [[ $diff_seconds -ge 0 ]]; then
-                        local hours=$((diff_seconds / 3600))
-                        local minutes=$(((diff_seconds % 3600) / 60))
-                        local seconds=$((diff_seconds % 60))
-                        printf "%02d:%02d:%02d\n" $hours $minutes $seconds
-                    else
-                        echo "00:00:00"
-                    fi
-                else
-                    echo "00:00:00"
-                fi
-            else
+            if [[ -z "$start_time" ]]; then
                 echo "00:00:00"
+                return
             fi
+            
+            # Parse start time
+            local start_hour=$(echo "$start_time" | cut -c 1-2)
+            local start_min=$(echo "$start_time" | cut -c 4-5)
+            local start_sec=$(echo "$start_time" | cut -c 7-8)
+            
+            # Parse current time
+            local curr_hour=$(echo "$current_time" | cut -c 1-2)
+            local curr_min=$(echo "$current_time" | cut -c 4-5)
+            local curr_sec=$(echo "$current_time" | cut -c 7-8)
+            
+            # Convert to seconds
+            local start_total=$((start_hour * 3600 + start_min * 60 + start_sec))
+            local curr_total=$((curr_hour * 3600 + curr_min * 60 + curr_sec))
+            
+            # Calculate difference
+            local diff_seconds=$((curr_total - start_total))
+            
+            # Handle day rollover
+            if [[ $diff_seconds -lt 0 ]]; then
+                diff_seconds=$((diff_seconds + 86400))
+            fi
+            
+            # Convert back to HH:MM:SS
+            local hours=$((diff_seconds / 3600))
+            local minutes=$(((diff_seconds % 3600) / 60))
+            local seconds=$((diff_seconds % 60))
+            
+            printf "%02d:%02d:%02d\n" $hours $minutes $seconds
         else
             echo "00:00:00"
         fi
     }
     
-    # Function to display user monitoring data
+    # Function to display user monitoring data - Simplified Proven Working Version
     display_user_monitor() {
         # Check if database exists
         if [[ ! -f "$DATABASE" ]]; then
@@ -1324,126 +1147,66 @@ show_online_users() {
             return 1
         fi
         
-        # Check if database is empty
-        if [[ ! -s "$DATABASE" ]]; then
-            echo -e "${BLUE}│${YELLOW} ⚠️  User database is empty                                  ${BLUE}│${RESET}"
-            echo -e "${BLUE}│${YELLOW} ℹ️  Please create users first using option 1                ${BLUE}│${RESET}"
-            echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
-            return 1
-        fi
-        
         # Initialize counters
         local total_users=0
         local online_users=0
-        local total_ssh=0
-        local total_ssl=0
-        local total_dropbear=0
-        local total_openvpn=0
         
-        # Read users from database and monitor each one
-        while IFS=' ' read -r user limit; do
-            # Skip empty lines
+        # Read users from database and monitor each one - EXACTLY like the proven working code
+        while IFS= read -r line; do
+            if [[ -z "$line" ]]; then
+                continue
+            fi
+            
+            local user=$(echo "$line" | cut -d' ' -f1)
+            local limit=$(echo "$line" | cut -d' ' -f2)
+            
+            # Skip if user is empty
             if [[ -z "$user" ]]; then
                 continue
             fi
             
             ((total_users++))
             
-            # Get connection counts with error handling
+            # Get connection counts - Simple and proven working
             local ssh_count=$(safe_number "$(get_ssh_connections "$user")")
-            local ssl_count=$(safe_number "$(get_ssl_tunnel_connections "$user")")
             local dropbear_count=$(safe_number "$(monitor_dropbear "$user")")
             local openvpn_count=$(safe_number "$(get_openvpn_connections "$user")")
             
-            # Debug info (comment out for production)
-            # echo "DEBUG: User $user - SSH:$ssh_count SSL:$ssl_count DBR:$dropbear_count VPN:$openvpn_count" >&2
-            
-            # Add to totals
-            total_ssh=$((total_ssh + ssh_count))
-            total_ssl=$((total_ssl + ssl_count))
-            total_dropbear=$((total_dropbear + dropbear_count))
-            total_openvpn=$((total_openvpn + openvpn_count))
-            
-            # Calculate total connections safely
-            local total_connections=$((ssh_count + ssl_count + dropbear_count + openvpn_count))
-            
-            # Ensure limit is a valid number
-            local user_limit=$(safe_number "$limit")
-            [[ $user_limit -eq 0 ]] && user_limit="∞"
+            # Calculate total connections
+            local total_connections=$((ssh_count + dropbear_count + openvpn_count))
             
             # Determine status and time
             local status
             local connection_time
-            local status_icon
-            local connection_type=""
             
             if [[ $total_connections -eq 0 ]]; then
                 status="${RED}Offline${RESET}"
-                status_icon="🔴"
                 connection_time="00:00:00"
             else
                 status="${GREEN}Online${RESET}"
-                status_icon="🟢"
                 ((online_users++))
                 
-                # Determine connection type and get time
+                # Get time from active connection (prioritize SSH, then OpenVPN)
                 if [[ $ssh_count -gt 0 ]]; then
                     connection_time=$(get_ssh_time "$user")
-                    connection_type="SSH"
-                elif [[ $ssl_count -gt 0 ]]; then
-                    connection_time=$(get_ssh_time "$user")  # SSL tunnel still uses SSH
-                    connection_type="SSL"
                 elif [[ $openvpn_count -gt 0 ]]; then
                     connection_time=$(get_openvpn_time "$user")
-                    connection_type="VPN"
-                elif [[ $dropbear_count -gt 0 ]]; then
-                    connection_time="00:00:00"  # Dropbear time tracking is complex
-                    connection_type="DBR"
                 else
                     connection_time="00:00:00"
                 fi
             fi
             
-            # Format connection display
-            local connection_display
-            if [[ "$user_limit" == "∞" ]]; then
-                connection_display=$(printf "%d/∞" $total_connections)
-            else
-                connection_display=$(printf "%d/%s" $total_connections "$user_limit")
-            fi
-            
-            # Format connection type display
-            local type_display=""
-            if [[ $total_connections -gt 0 ]]; then
-                type_display="[$connection_type]"
-            fi
-            
-            # Display user info with professional formatting
-            printf "${BLUE}│${status_icon} ${YELLOW}%-11s ${status}%-8s ${WHITE}%-10s ${WHITE}%-12s ${GREEN}%-6s ${BLUE}│${RESET}\n" \
-                   "$user" " " "$connection_display" "$connection_time" "$type_display"
+            # Format and display user info - Exactly like proven working code
+            printf "${BLUE}│${YELLOW} %-13s ${WHITE}%-12s ${WHITE}%-5s/%-7s ${WHITE}%-13s ${BLUE}│${RESET}\n" \
+                   "$user" "$status" "$total_connections" "$limit" "$connection_time"
             
         done < "$DATABASE"
         
         echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
         
-        # Professional summary with connection types
+        # Summary - Simple and working
         echo ""
-        echo -e "${BLUE}📊 ${WHITE}REAL-TIME SUMMARY:${RESET}"
-        echo -e "${WHITE}   👥 Total Users: ${GREEN}$total_users${WHITE} | 🟢 Online: ${GREEN}$online_users${WHITE} | 🔴 Offline: ${RED}$((total_users - online_users))${RESET}"
-        echo -e "${WHITE}   🔗 Connections: SSH(${GREEN}$total_ssh${WHITE}) SSL(${YELLOW}$total_ssl${WHITE}) VPN(${BLUE}$total_openvpn${WHITE}) DBR(${GREEN}$total_dropbear${WHITE})${RESET}"
-        
-        # Show system connection status for debugging
-        local stunnel_status="❌"
-        local stunnel_connections=0
-        if pgrep -f stunnel >/dev/null 2>&1; then
-            stunnel_status="✅"
-            stunnel_connections=$(ss -tn 2>/dev/null | grep ":443.*ESTAB" | wc -l)
-        fi
-        
-        local ssh_port_connections=$(ss -tn 2>/dev/null | grep ":22.*ESTAB" | wc -l)
-        local total_established=$(ss -tn 2>/dev/null | grep "ESTAB" | wc -l)
-        
-        echo -e "${WHITE}   🛡️  System: Stunnel${stunnel_status} SSL-Conns(${stunnel_connections}) SSH-Port(${ssh_port_connections}) Total(${total_established})${RESET}"
+        echo -e "${YELLOW}Summary: ${WHITE}Total Users: ${GREEN}$total_users${WHITE} | Online: ${GREEN}$online_users${WHITE} | Offline: ${RED}$((total_users - online_users))${RESET}"
         echo ""
     }
     
