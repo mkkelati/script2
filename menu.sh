@@ -993,123 +993,209 @@ EOC
 }
 
 show_online_users() {
-  clear
-  if [[ -e /usr/lib/licence ]]; then
-    database="$USER_LIST_FILE"
-    tmp_now=$(printf '%(%H%M%S)T\n')
+    # Configuration
+    local DATABASE="$USER_LIST_FILE"
+    local OPENVPN_STATUS="/etc/openvpn/openvpn-status.log"
+    local AUTH_LOG="/var/log/auth.log"
     
-    fun_drop () {
-      port_dropbear=`ps aux | grep dropbear | awk NR==1 | awk '{print $17;}'`
-      log=/var/log/auth.log
-      loginsukses='Password auth succeeded'
-      clear
-      pids=`ps ax |grep dropbear |grep  " $port_dropbear" |awk -F" " '{print $1}'`
-      for pid in $pids
-      do
-          pidlogs=`grep $pid $log |grep "$loginsukses" |awk -F" " '{print $3}'`
-          i=0
-          for pidend in $pidlogs
-          do
-            let i=i+1
-          done
-          if [ $pidend ];then
-             login=`grep $pid $log |grep "$pidend" |grep "$loginsukses"`
-             PID=$pid
-             user=`echo $login |awk -F" " '{print $10}' | sed -r "s/'/ /g"`
-             waktu=`echo $login |awk -F" " '{print $2"-"$1,$3}'`
-             while [ ${#waktu} -lt 13 ]; do
-                 waktu=$waktu" "
-             done
-             while [ ${#user} -lt 16 ]; do
-                 user=$user" "
-             done
-             while [ ${#PID} -lt 8 ]; do
-                 PID=$PID" "
-             done
-             echo "$user $PID $waktu"
-          fi
-      done
+    # Colors for display
+    local RED='\033[1;31m'
+    local GREEN='\033[1;32m'
+    local YELLOW='\033[1;33m'
+    local BLUE='\033[1;36m'
+    local WHITE='\033[1;37m'
+    local RESET='\033[0m'
+    
+    # Function to monitor Dropbear connections
+    monitor_dropbear() {
+        local user="$1"
+        local port_dropbear=$(ps aux | grep dropbear | awk 'NR==1 {print $17}')
+        local log="$AUTH_LOG"
+        local loginsukses='Password auth succeeded'
+        local count=0
+        
+        if [[ -z "$port_dropbear" ]]; then
+            echo "0"
+            return
+        fi
+        
+        local pids=$(ps ax | grep dropbear | grep " $port_dropbear" | awk '{print $1}')
+        
+        for pid in $pids; do
+            local pidlogs=$(grep "$pid" "$log" 2>/dev/null | grep "$loginsukses" | awk '{print $3}')
+            local pidend=""
+            
+            for pidend_item in $pidlogs; do
+                pidend="$pidend_item"
+            done
+            
+            if [[ -n "$pidend" ]]; then
+                local login=$(grep "$pid" "$log" 2>/dev/null | grep "$pidend" | grep "$loginsukses")
+                local logged_user=$(echo "$login" | awk '{print $10}' | sed -r "s/'//g")
+                
+                if [[ "$logged_user" == "$user" ]]; then
+                    ((count++))
+                fi
+            fi
+        done
+        
+        echo "$count"
     }
     
-    echo -e "\E[44;1;37m◇ㅤUser       ◇ㅤStatus     ◇ㅤConnection   ◇ㅤTime \E[0m"
-    echo ""
-    echo ""
+    # Function to get SSH connection count for a user
+    get_ssh_connections() {
+        local user="$1"
+        if grep -q "^$user:" /etc/passwd 2>/dev/null; then
+            ps -u "$user" 2>/dev/null | grep -c sshd || echo "0"
+        else
+            echo "0"
+        fi
+    }
     
-    while read usline
-    do  
-        user="$(echo $usline | cut -d: -f1)"
-        s2ssh="$(echo $usline | cut -d: -f2)"
-        if [ "$(cat /etc/passwd| grep -w $user| wc -l)" = "1" ]; then
-          sqd="$(ps -u $user | grep sshd | wc -l)"
+    # Function to get OpenVPN connection count for a user
+    get_openvpn_connections() {
+        local user="$1"
+        if [[ -e "$OPENVPN_STATUS" ]]; then
+            grep -E ",$user," "$OPENVPN_STATUS" 2>/dev/null | wc -l || echo "0"
         else
-          sqd=00
+            echo "0"
         fi
-        [[ "$sqd" = "" ]] && sqd=0
-        if [[ -e /etc/openvpn/openvpn-status.log ]]; then
-          ovp="$(cat /etc/openvpn/openvpn-status.log | grep -E ,"$user", | wc -l)"
+    }
+    
+    # Function to get connection time for SSH
+    get_ssh_time() {
+        local user="$1"
+        local ssh_pid=$(ps -u "$user" 2>/dev/null | grep sshd | awk 'NR==1 {print $1}')
+        
+        if [[ -n "$ssh_pid" ]]; then
+            local etime=$(ps -o etime= -p "$ssh_pid" 2>/dev/null | tr -d ' ')
+            local time_length=${#etime}
+            
+            if [[ "$time_length" -le 8 ]]; then
+                echo "00:$etime"
+            else
+                echo "$etime"
+            fi
         else
-          ovp=0
+            echo "00:00:00"
         fi
-        if netstat -nltp|grep 'dropbear'> /dev/null;then
-          drop="$(fun_drop | grep "$user" | wc -l)"
+    }
+    
+    # Function to get connection time for OpenVPN
+    get_openvpn_time() {
+        local user="$1"
+        if [[ -e "$OPENVPN_STATUS" ]]; then
+            local start_time=$(grep -w "$user" "$OPENVPN_STATUS" 2>/dev/null | awk '{print $4}' | head -1)
+            local current_time=$(printf '%(%H:%M:%S)T\n')
+            
+            if [[ -z "$start_time" ]]; then
+                echo "00:00:00"
+                return
+            fi
+            
+            # Parse start time
+            local start_hour=$(echo "$start_time" | cut -c 1-2)
+            local start_min=$(echo "$start_time" | cut -c 4-5)
+            local start_sec=$(echo "$start_time" | cut -c 7-8)
+            
+            # Parse current time
+            local curr_hour=$(echo "$current_time" | cut -c 1-2)
+            local curr_min=$(echo "$current_time" | cut -c 4-5)
+            local curr_sec=$(echo "$current_time" | cut -c 7-8)
+            
+            # Convert to seconds
+            local start_total=$((start_hour * 3600 + start_min * 60 + start_sec))
+            local curr_total=$((curr_hour * 3600 + curr_min * 60 + curr_sec))
+            
+            # Calculate difference
+            local diff_seconds=$((curr_total - start_total))
+            
+            # Handle day rollover
+            if [[ $diff_seconds -lt 0 ]]; then
+                diff_seconds=$((diff_seconds + 86400))
+            fi
+            
+            # Convert back to HH:MM:SS
+            local hours=$((diff_seconds / 3600))
+            local minutes=$(((diff_seconds % 3600) / 60))
+            local seconds=$((diff_seconds % 60))
+            
+            printf "%02d:%02d:%02d\n" $hours $minutes $seconds
         else
-          drop=0
+            echo "00:00:00"
         fi
-        cnx=$(($sqd + $drop))
-        conex=$(($cnx + $ovp))
-        if [[ $cnx -gt 0 ]]; then
-          tst="$(ps -o etime $(ps -u $user |grep sshd |awk 'NR==1 {print $1}')|awk 'NR==2 {print $1}')"
-          tst1=$(echo "$tst" | wc -c)
-        if [[ "$tst1" == "9" ]]; then 
-          timerr="$(ps -o etime $(ps -u $user |grep sshd |awk 'NR==1 {print $1}')|awk 'NR==2 {print $1}')"
-        else
-          timerr="$(echo "00:$tst")"
-        fi
-        elif [[ $ovp -gt 0 ]]; then
-          tmp2=$(printf '%(%H:%M:%S)T\n')
-          tmp1="$(grep -w "$user" /etc/openvpn/openvpn-status.log |awk '{print $4}'| head -1)"
-          [[ "$tmp1" = "" ]] && tmp1="00:00:00" && tmp2="00:00:00"
-          var1=`echo $tmp1 | cut -c 1-2`
-          var2=`echo $tmp1 | cut -c 4-5`
-          var3=`echo $tmp1 | cut -c 7-8`
-          var4=`echo $tmp2 | cut -c 1-2`
-          var5=`echo $tmp2 | cut -c 4-5`
-          var6=`echo $tmp2 | cut -c 7-8`
-          calc1=`echo $var1*3600 + $var2*60 + $var3 | bc`
-          calc2=`echo $var4*3600 + $var5*60 + $var6 | bc`
-          seg=$(($calc2 - $calc1))
-          min=$(($seg/60))
-          seg=$(($seg-$min*60))
-          hor=$(($min/60))
-          min=$(($min-$hor*60))
-          timerusr=`printf "%02d:%02d:%02d \n" $hor $min $seg;`
-          timerr=$(echo "$timerusr" | sed -e 's/[^0-9:]//ig' )
-        else
-          timerr="00:00:00"
-        fi
-        if [[ $conex -eq 0 ]]; then
-           status=$(echo -e "\033[1;31mOffline \033[1;33m       ")
-           echo -ne "\033[1;33m"
-           printf '%-17s%-14s%-10s%s\n' " $user"      "$status" "$conex/$s2ssh" "$timerr" 
-        else
-           status=$(echo -e "\033[1;32mOnline\033[1;33m         ")
-           echo -ne "\033[1;33m"
-           printf '%-17s%-14s%-10s%s\n' " $user"      "$status" "$conex/$s2ssh" "$timerr"
-        fi
-        echo -e "\033[0;34m◇────────────────────────────────────────────────◇\033[0m"
-    done < "$database"
-  else
-  echo ">> Online Users <<"
-  [[ -s "$USER_LIST_FILE" ]] || { echo "No users created yet."; return; }
-  any=0
-  while IFS=: read -r username limit; do
-    if pgrep -u "$username" sshd >/dev/null 2>&1; then
-      [[ "$any" -eq 0 ]] && { echo "Active SSH sessions:"; any=1; }
-      echo " - $username"
+    }
+    
+    # Main monitoring function
+    clear
+    
+    # Header
+    echo -e "${BLUE}┌────────────────────────────────────────────────────────────┐${RESET}"
+    echo -e "${BLUE}│${WHITE}                    ONLINE USER MONITOR                     ${BLUE}│${RESET}"
+    echo -e "${BLUE}├────────────────────────────────────────────────────────────┤${RESET}"
+    echo -e "${BLUE}│${WHITE} User           Status      Connections    Time           ${BLUE}│${RESET}"
+    echo -e "${BLUE}├────────────────────────────────────────────────────────────┤${RESET}"
+    
+    # Check if database exists
+    if [[ ! -f "$DATABASE" ]]; then
+        echo -e "${BLUE}│${RED} No user database found at: $DATABASE${BLUE}                │${RESET}"
+        echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
+        return 1
     fi
-  done < "$USER_LIST_FILE"
-  [[ "$any" -eq 0 ]] && echo "No active SSH connections for managed users."
-  fi
+    
+    # Initialize counters
+    local total_users=0
+    local online_users=0
+    
+    # Read users from database and monitor each one
+    while IFS=' ' read -r user limit; do
+        if [[ -z "$user" ]]; then
+            continue
+        fi
+        
+        ((total_users++))
+        
+        # Get connection counts
+        local ssh_count=$(get_ssh_connections "$user")
+        local dropbear_count=$(monitor_dropbear "$user")
+        local openvpn_count=$(get_openvpn_connections "$user")
+        
+        # Calculate total connections
+        local total_connections=$((ssh_count + dropbear_count + openvpn_count))
+        
+        # Determine status and time
+        local status
+        local connection_time
+        
+        if [[ $total_connections -eq 0 ]]; then
+            status="${RED}Offline${RESET}"
+            connection_time="00:00:00"
+        else
+            status="${GREEN}Online${RESET}"
+            ((online_users++))
+            
+            # Get time from active connection (prioritize SSH, then OpenVPN)
+            if [[ $ssh_count -gt 0 ]]; then
+                connection_time=$(get_ssh_time "$user")
+            elif [[ $openvpn_count -gt 0 ]]; then
+                connection_time=$(get_openvpn_time "$user")
+            else
+                connection_time="00:00:00"
+            fi
+        fi
+        
+        # Format and display user info
+        printf "${BLUE}│${YELLOW} %-13s ${WHITE}%-12s ${WHITE}%-5s/%-7s ${WHITE}%-13s ${BLUE}│${RESET}\n" \
+               "$user" "$status" "$total_connections" "$limit" "$connection_time"
+        
+    done < "$DATABASE"
+    
+    echo -e "${BLUE}└────────────────────────────────────────────────────────────┘${RESET}"
+    
+    # Summary
+    echo ""
+    echo -e "${YELLOW}Summary: ${WHITE}Total Users: ${GREEN}$total_users${WHITE} | Online: ${GREEN}$online_users${WHITE} | Offline: ${RED}$((total_users - online_users))${RESET}"
+    echo ""
 }
 
 uninstall_script() {
